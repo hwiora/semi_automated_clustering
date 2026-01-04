@@ -1,6 +1,6 @@
 # Semi-Automated Clustering
 
-Interactive Python application for clustering and annotating high-dimensional data using UMAP embeddings and visual inspection. Originally designed for vocalization analysis but applicable to any time-series segmentation data.
+Interactive Python application for clustering and annotating high-dimensional data using UMAP embeddings and visual inspection. Originally designed for vocalization analysis but applicable to any time-series segmentation data. **THE CODE FOR SEGMENTATION AND WHISPER EMBEDDING (PRIOR STEPS TO THIS EXPLORER) WILL BE UPLOADED SOON**
 
 ## Features
 
