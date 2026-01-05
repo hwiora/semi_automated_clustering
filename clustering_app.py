@@ -17,6 +17,8 @@ Keyboard Controls:
 
 import argparse
 import numpy as np
+import tkinter as tk
+from tkinter import filedialog
 import matplotlib
 matplotlib.use('TkAgg')  # Use TkAgg backend to avoid Qt event loop issues
 import matplotlib.pyplot as plt
@@ -1048,12 +1050,7 @@ class ClusteringApp:
             self.input_buffer = ""
             return
         
-        # Handle export filename (string, not number)
-        if self.input_mode == 'export':
-            self._do_export(self.input_buffer.strip())
-            self.input_mode = None
-            self.input_buffer = ""
-            return
+
         
         if not self.input_buffer:
             print("\nNo input provided.")
@@ -1627,14 +1624,39 @@ class ClusteringApp:
 
     
     def _export_to_hdf5(self) -> None:
-        """Start export input mode."""
+        """Start export to HDF5 using native save dialog."""
         print("\n" + "="*60)
         print("EXPORT TO HDF5")
         print("="*60)
-        print(">>> Type filename + Enter IN THE FIGURE WINDOW <<<")
-        print(">>> (Leave blank and press Enter for auto-name) <<<")
-        self.input_mode = 'export'
-        self.input_buffer = ""
+        
+        # Default filename
+        from datetime import datetime
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"clusters_{timestamp}.h5"
+        
+        # Use tkinter for save dialog
+        try:
+            root = tk.Tk()
+            root.withdraw()  # Hide the root window
+            
+            file_path = filedialog.asksaveasfilename(
+                defaultextension=".h5",
+                filetypes=[("HDF5 files", "*.h5"), ("All files", "*.*")],
+                initialdir=Path.cwd(),
+                initialfile=default_name,
+                title="Export Clusters to HDF5"
+            )
+            
+            root.destroy()
+            
+            if file_path:
+                self._do_export(file_path)
+            else:
+                print("Export cancelled.")
+        except Exception as e:
+            print(f"Dialog error: {e}")
+            print("Falling back to auto-name export...")
+            self._do_export(default_name)
     
     def _do_export(self, filename: str) -> None:
         """Actually perform the export."""

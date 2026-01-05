@@ -1,0 +1,27 @@
+# Audio Preprocessing Pipeline Dependencies
+#
+# IMPORTANT: For GPU support, install PyTorch with CUDA BEFORE running pip install:
+#   pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu121
+# Then run: pip install -r requirements.txt
+
+# Core scientific computing
+numpy
+tqdm
+scikit-learn
+
+# Audio processing
+librosa
+praat-parselmouth
+
+# Machine learning / embeddings (PyTorch should be installed separately with CUDA, see above)
+# torch  # <-- Install with CUDA separately!
+umap-learn
+ctranslate2
+transformers
+huggingface-hub
+
+# Data storage
+h5py
+
+# WhisperSeg (from fork with embedding support)
+git+https://github.com/hwiora/WhisperSeg.git

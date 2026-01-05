@@ -1,9 +1,24 @@
 # Semi-Automated Clustering
 
-Interactive Python application for clustering and annotating high-dimensional data using UMAP embeddings and visual inspection. Originally designed for vocalization analysis but applicable to any time-series segmentation data. **THE CODE FOR SEGMENTATION AND WHISPER EMBEDDING (PRIOR STEPS TO THIS EXPLORER) WILL BE UPLOADED SOON**
+Interactive Python application for clustering and annotating high-dimensional data using UMAP embeddings and visual inspection. Originally designed for vocalization analysis but applicable to any time-series segmentation data.
+
+## Overview
+
+This repository contains two main components:
+
+1. **Preprocessing Pipeline** (`preprocessing/`) - Converts raw audio recordings into HDF5 format ready for clustering
+2. **Clustering App** (`clustering_app.py`) - Interactive tool for semi-automated cluster annotation
 
 ## Features
 
+### Preprocessing Pipeline
+- **Spectrogram computation** - Convert audio to spectrograms using librosa
+- **Segmentation** - Detect vocalizations using [WhisperSeg](https://github.com/nianlonggu/WhisperSeg)
+- **Embedding extraction** - Generate neural embeddings for each vocalization
+- **UMAP projection** - Reduce embedding dimensionality for visualization
+- **HDF5 export** - Package everything for the clustering app
+
+### Clustering App
 - **Interactive UMAP Visualization**: Click to select clusters of points in embedding space
 - **Blob Detection**: Automatic density-based grouping with adjustable threshold and radius
 - **Spectrogram Viewer**: View and navigate spectrograms sorted by various criteria
@@ -14,28 +29,123 @@ Interactive Python application for clustering and annotating high-dimensional da
 - **Multiple Sort Modes**: Timestamp, duration, random, nearest-neighbor chain, outlier-first
 - **HDF5 Export/Import**: Save and reload your work
 
+---
+
 ## Installation
 
+### 1. Clone the repository
+
 ```bash
-# Clone the repository
-git clone https://github.com/mesahwi/semi_automated_clustering.git
+git clone https://github.com/hwiora/semi_automated_clustering.git
 cd semi_automated_clustering
-
-# Create conda environment (recommended)
-conda create -n clustering python=3.10
-conda activate clustering
-
-# Install dependencies
-pip install -r requirements.txt
 ```
 
+### 2. Create conda environment
+
+```bash
+conda create -n clustering python=3.10
+conda activate clustering
+```
+
+### 3. Install dependencies
+
+```bash
+# Install clustering app dependencies
+pip install -r requirements.txt
+
+# Install preprocessing dependencies
+pip install -r preprocessing/requirements.txt
+
+# Install WhisperSeg (modified version)
+pip install git+https://github.com/hwiora/WhisperSeg.git
+```
+
+---
+
 ## Quick Start
+
+### Option 1: Full Pipeline (Raw Audio → Clustering)
+
+```bash
+# Step 1: Preprocess your audio data
+cd preprocessing
+python preprocess.py --subject MY_SUBJECT \
+    --data-dir /path/to/audio/data \
+    --output-dir /path/to/output \
+    --all
+
+# Step 2: Run the clustering app
+cd ..
+python clustering_app.py /path/to/output/MY_SUBJECT.h5
+```
+
+### Option 2: Use Existing HDF5 Data
 
 ```bash
 python clustering_app.py path/to/your/data.h5
 ```
 
-## Keyboard Controls
+---
+
+## Preprocessing Pipeline
+
+The preprocessing pipeline converts raw audio recordings into HDF5 format.
+
+### Input Data Format
+
+Your audio data should be organized in subdirectories (e.g., typically day folders, but can be any name):
+
+```
+data/
+├── 001/           # Day 1 (or any subfolder name)
+│   ├── file1.wav
+│   └── file2.wav
+├── subfolder_B/   # Another subfolder
+│   └── ...
+└── ...
+```
+
+### Usage
+
+```bash
+cd preprocessing
+
+# Run all steps (recommended for first-time use):
+python preprocess.py --subject MY_SUBJECT \
+    --data-dir /path/to/audio \
+    --output-dir /path/to/output \
+    --all \
+    --device cuda
+
+# Or run individual steps:
+python preprocess.py --subject MY_SUBJECT \
+    --data-dir /path/to/audio \
+    --output-dir /path/to/output \
+    --compute-spectrograms \
+    --compute-segmentations \
+    --compute-embeddings \
+    --compute-umap \
+    --export-hdf5
+```
+
+### Key Parameters
+
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `--sr` | 32000 | Sample rate (Hz) |
+| `--segmenter-model` | nccratliri/whisperseg-base-animal-vad-ct2 | WhisperSeg model |
+| `--n-neighbors` | 100 | UMAP neighbors |
+| `--n-pca` | 10 | PCA components to include |
+| `--device` | cuda | Device for ML models (cuda or cpu) |
+| `--hdf5-output` | {output_dir}/{subject}.h5 | Custom HDF5 output path |
+
+Run `python preprocess.py --help` for all options.
+
+---
+
+## Clustering App
+
+### Keyboard Controls
 
 | Key | Action |
 |-----|--------|
@@ -53,35 +163,7 @@ python clustering_app.py path/to/your/data.h5
 | `x` | Export to HDF5 |
 | `q` | Quit |
 
-## Data Format
-
-The application uses HDF5 files with the following structure:
-
-```
-data.h5
-├── segments/                    # Segment metadata
-│   ├── file_id                  # Which source file
-│   ├── onset_sec                # Segment start time (seconds)
-│   ├── duration_sec             # Segment duration (seconds)
-│   ├── onset_sample             # Start sample index
-│   ├── duration_samples         # Duration in samples
-│   ├── umap_x, umap_y           # UMAP coordinates
-│   ├── cluster_id               # Cluster assignment
-│   └── pc_0, pc_1, ...          # PCA embeddings (optional)
-├── files/                       # Source file metadata
-│   └── path                     # File paths
-├── spectrograms/                # Spectrogram data
-│   ├── 0                        # Full spectrogram for file 0
-│   ├── 1                        # Full spectrogram for file 1
-│   └── ...
-├── parameters/                  # Processing parameters
-│   └── attrs: scanrate, nonoverlap, ...
-└── umap_maprange               # UMAP axis limits (optional)
-```
-You can find the data in Zenodo:
-https://doi.org/10.5281/zenodo.18100613
-
-## Workflow
+### Workflow
 
 1. **Start in CLUSTERING mode**: View existing cluster assignments
 2. **Press `c` to enter BLOBBING mode**: 
@@ -94,6 +176,70 @@ https://doi.org/10.5281/zenodo.18100613
 4. **Press `c` and confirm to finalize**:
    - Returns to CLUSTERING mode with new assignments
 5. **Press `x` to export**: Save your work to HDF5
+
+---
+
+## HDF5 Data Format
+
+The HDF5 file structure used by both the preprocessing pipeline and clustering app:
+
+```
+data.h5
+├── segments/                    # Segment metadata
+│   ├── segment_id               # Segment index
+│   ├── file_id                  # Which source file
+│   ├── onset_sec                # Segment start time (seconds)
+│   ├── duration_sec             # Segment duration (seconds)
+│   ├── onset_sample             # Start sample index
+│   ├── duration_samples         # Duration in samples
+│   ├── umap_x, umap_y           # UMAP coordinates
+│   ├── cluster_id               # Cluster assignment
+│   └── pc_0, pc_1, ...          # PCA components
+├── files/                       # Source file metadata
+│   └── path                     # File paths
+├── embeddings/                  # Raw embeddings
+│   └── raw                      # Full embedding vectors
+├── spectrograms/                # Spectrogram data
+│   ├── 0                        # Full spectrogram for file 0
+│   ├── 1                        # Full spectrogram for file 1
+│   └── ...
+├── parameters/                  # Processing parameters
+│   └── attrs: scanrate, nonoverlap, ...
+└── umap_maprange               # UMAP axis limits
+```
+
+---
+
+## Example Data
+
+Sample data is available on Zenodo: https://doi.org/10.5281/zenodo.18100613
+
+---
+
+## Citation
+
+If you use this tool in your research, please cite:
+
+```bibtex
+@software{semi_automated_clustering,
+  author = {Lee, Kanghwi},
+  title = {Semi-Automated Clustering},
+  url = {https://github.com/hwiora/semi_automated_clustering}
+}
+```
+
+For the WhisperSeg segmentation model:
+
+```bibtex
+@inproceedings{gu2024whisperseg,
+  title={Positive Transfer of the Whisper Speech Transformer to Human and Animal Voice Activity Detection},
+  author={Gu, Nianlong and others},
+  booktitle={ICASSP 2024},
+  year={2024}
+}
+```
+
+---
 
 ## License
 
