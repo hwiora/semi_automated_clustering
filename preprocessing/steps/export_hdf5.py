@@ -19,7 +19,7 @@ from preprocessing_utils import get_all_days, get_day_string
 def export_to_hdf5(subject_name, data_dir, spectrograms_dir, segmentation_dir, 
                    embedding_dir, umap_dir, output_path, 
                    sr=32000, hop_length=128, n_pca_components=100,
-                   embedding_style='first_timebin', n_neighbors=100):
+                   embedding_style='first_timebin', n_neighbors=100, all_args=None):
     """Export all preprocessing results to HDF5 format for clustering_app.
     
     Args:
@@ -49,8 +49,6 @@ def export_to_hdf5(subject_name, data_dir, spectrograms_dir, segmentation_dir,
     all_filenames = []
     all_onset_sec = []
     all_duration_sec = []
-    all_onset_sample = []
-    all_duration_samples = []
     all_embeddings = []
     
     # Storage for files
@@ -116,8 +114,6 @@ def export_to_hdf5(subject_name, data_dir, spectrograms_dir, segmentation_dir,
             all_filenames.append(fname)
             all_onset_sec.append(onset)
             all_duration_sec.append(duration)
-            all_onset_sample.append(int(onset * sr))
-            all_duration_samples.append(int(duration * sr))
             all_embeddings.append(embedding)
     
     if len(all_embeddings) == 0:
@@ -154,38 +150,98 @@ def export_to_hdf5(subject_name, data_dir, spectrograms_dir, segmentation_dir,
         seg_grp.create_dataset('file_id', data=np.array(all_file_ids, dtype=np.int32))
         seg_grp.create_dataset('onset_sec', data=np.array(all_onset_sec, dtype=np.float32))
         seg_grp.create_dataset('duration_sec', data=np.array(all_duration_sec, dtype=np.float32))
-        seg_grp.create_dataset('onset_sample', data=np.array(all_onset_sample, dtype=np.int64))
-        seg_grp.create_dataset('duration_samples', data=np.array(all_duration_samples, dtype=np.int64))
-        seg_grp.create_dataset('umap_x', data=umap_coords[:, 0].astype(np.float32))
-        seg_grp.create_dataset('umap_y', data=umap_coords[:, 1].astype(np.float32))
+        seg_grp.create_dataset('umap', data=umap_coords.astype(np.float32))  # Shape: (n_segments, 2)
         seg_grp.create_dataset('cluster_id', data=np.zeros(len(all_file_ids), dtype=np.int32))
-        
-        # Add PCA coordinates as pc_0, pc_1, ...
-        for i in range(pca_coords.shape[1]):
-            seg_grp.create_dataset(f'pc_{i}', data=pca_coords[:, i].astype(np.float32))
+        seg_grp.create_dataset('pca', data=pca_coords.astype(np.float32))  # Shape: (n_segments, n_components)
         
         # Create files group
         files_grp = f.create_group('files')
+        files_grp.create_dataset('file_id', data=np.arange(len(file_paths), dtype=np.int32))
         # Convert paths to bytes for HDF5
         path_bytes = np.array([p.encode('utf-8') for p in file_paths], dtype='S')
         files_grp.create_dataset('path', data=path_bytes)
         
         # Create embeddings group (raw embeddings only, PCA is in segments/pc_*)
         emb_grp = f.create_group('embeddings')
+        emb_grp.create_dataset('segment_id', data=np.arange(len(all_file_ids), dtype=np.int32))
         emb_grp.create_dataset('raw', data=embeddings_array, compression='gzip')
         
         # Create spectrograms group
         spec_grp = f.create_group('spectrograms')
+        spec_grp.create_dataset('file_id', data=np.array(list(spectrograms.keys()), dtype=np.int32))
         for file_id, spec in tqdm(spectrograms.items(), desc='Writing spectrograms'):
             spec_grp.create_dataset(str(file_id), data=spec, compression='gzip')
         
         # Create parameters group
         params_grp = f.create_group('parameters')
-        params_grp.attrs['scanrate'] = sr
-        params_grp.attrs['nonoverlap'] = hop_length
+        
+        # Store all CLI arguments with step-based prefixes (for organization)
+        if all_args is not None:
+            args_dict = vars(all_args)
+            
+            # Define parameter categories and their prefixes
+            param_map = {
+                # General
+                'subject': 'subject',
+                'data_dir': 'data_dir',
+                'output_dir': 'output_dir',
+                'device': 'device',
+                
+                # Audio/Spectrogram parameters
+                'sr': 'audio_sr',
+                'n_fft': 'spec_n_fft',
+                'hop_length': 'spec_hop_length',
+                'spec_min_freq': 'spec_min_freq',
+                'spec_max_freq': 'spec_max_freq',
+                
+                # Pitch parameters
+                'pitch_floor': 'pitch_floor',
+                
+                # Segmentation (WhisperSeg) parameters
+                'segmenter_model': 'seg_model',
+                'seg_min_freq': 'seg_min_freq',
+                'seg_time_step': 'seg_time_step',
+                'seg_min_length': 'seg_min_length',
+                'seg_eps': 'seg_eps',
+                'seg_num_trials': 'seg_num_trials',
+                
+                # Embedding parameters
+                'embedder_model': 'emb_model',
+                'emb_min_freq': 'emb_min_freq',
+                'emb_time_step': 'emb_time_step',
+                'emb_num_trials': 'emb_num_trials',
+                'embedding_style': 'emb_style',
+                'batch_size': 'emb_batch_size',
+                
+                # UMAP parameters
+                'n_neighbors': 'umap_n_neighbors',
+                'train_percentage': 'umap_train_percentage(0-1)',
+                
+                # PCA/Export parameters
+                'n_pca': 'pca_n_components',
+            }
+            
+            for arg_name, param_name in param_map.items():
+                if arg_name in args_dict:
+                    val = args_dict[arg_name]
+                    if val is not None and isinstance(val, (str, int, float, bool)):
+                        params_grp.attrs[param_name] = val
+        
+        # Store key derived parameters (ensure these exist even if all_args not provided)
+        params_grp.attrs['sr_processing'] = sr  # Rate used for spectrograms
+        # params_grp.attrs['nonoverlap'] = hop_length
         params_grp.attrs['n_pca_components'] = n_pca_components
         params_grp.attrs['n_neighbors'] = n_neighbors
         params_grp.attrs['subject'] = subject_name
+        
+        # Detect and store original wav sample rate
+        if file_paths:
+            import wave
+            try:
+                with wave.open(file_paths[0], 'rb') as wf:
+                    params_grp.attrs['sr_original'] = wf.getframerate()
+            except Exception:
+                params_grp.attrs['sr_original'] = sr  # Fallback to processing rate
         
         # Save UMAP map range for visualization
         umap_min = umap_coords.min(axis=0)

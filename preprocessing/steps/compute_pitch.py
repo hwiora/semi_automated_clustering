@@ -7,6 +7,10 @@ from glob import glob
 
 import parselmouth
 from tqdm import tqdm
+import warnings
+
+# Suppress Praat warnings about small files
+warnings.filterwarnings("ignore", category=parselmouth.PraatWarning)
 
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

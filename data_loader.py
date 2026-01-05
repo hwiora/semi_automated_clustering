@@ -35,16 +35,37 @@ class FlatData:
     
     @property
     def scanrate(self) -> int:
-        return self.parameters.get('scanrate', 44100)
+        """Get processing sample rate (for spectrogram slicing)."""
+        # Try new name first, then legacy name
+        if 'sr_processing' in self.parameters:
+            return self.parameters['sr_processing']
+        if 'scanrate' in self.parameters:
+            return self.parameters['scanrate']
+        return 32000  # Default preprocessing rate
+    
+    @property
+    def sr_original(self) -> Optional[int]:
+        """Get original wav file sample rate (if stored)."""
+        return self.parameters.get('sr_original')
     
     @property
     def umap_coords(self) -> np.ndarray:
         """Get UMAP coordinates as (N, 2) array."""
-        return self.segments[['umap_x', 'umap_y']].values
+        # New format: 'umap' matrix (stored as list of arrays in DataFrame)
+        if 'umap' in self.segments.columns:
+            return np.stack(self.segments['umap'].values)
+        # Legacy format: separate umap_x, umap_y columns
+        if 'umap_x' in self.segments.columns:
+            return self.segments[['umap_x', 'umap_y']].values
+        return np.zeros((len(self.segments), 2))
     
     @property
     def pc_coords(self) -> Optional[np.ndarray]:
         """Get PC coordinates if available."""
+        # New format: 'pca' matrix (stored as list of arrays in DataFrame)
+        if 'pca' in self.segments.columns:
+            return np.stack(self.segments['pca'].values)
+        # Legacy format: separate pc_0, pc_1, ... columns
         pc_cols = [c for c in self.segments.columns if c.startswith('pc_')]
         if pc_cols:
             return self.segments[pc_cols].values
@@ -100,18 +121,23 @@ class FlatData:
         
         row = self.segments.iloc[segment_id]
         file_id = int(row['file_id'])
-        onset_sample = int(row['onset_sample'])
-        duration_samples = int(row['duration_samples'])
+        onset_sec = float(row['onset_sec'])
+        duration_sec = float(row['duration_sec'])
+        
+        # Compute samples from seconds using stored sample rate
+        sr = self.scanrate
+        onset_sample = int(onset_sec * sr)
+        duration_samples = int(duration_sec * sr)
         
         full_spec = self.get_spectrogram(file_id)
         if full_spec is None:
             return None
         
         # Convert samples to spectrogram columns
-        # nonoverlap = hop size in samples (128 for 44100Hz, 512 nfft)
-        nonoverlap = self.parameters.get('nonoverlap', 128)
-        start_col = onset_sample // nonoverlap
-        end_col = (onset_sample + duration_samples) // nonoverlap
+        # hop_length = hop size in samples (e.g., 128)
+        hop_length = self.parameters.get('hop_length', self.parameters.get('nonoverlap', 128))
+        start_col = onset_sample // hop_length
+        end_col = (onset_sample + duration_samples) // hop_length
         
         # Clamp to valid range
         start_col = max(0, start_col)
@@ -175,7 +201,11 @@ def _load_from_hdf5(hdf5_path: Path) -> FlatData:
                 data = f['segments'][key][:]
                 if data.dtype.kind == 'S':  # byte string
                     data = data.astype(str)
-                segments_data[key] = data
+                # Handle 2D arrays (umap, pca) - store as list of arrays
+                if len(data.shape) == 2:
+                    segments_data[key] = [row for row in data]
+                else:
+                    segments_data[key] = data
         segments = pd.DataFrame(segments_data)
         
         # Load files (optional)
@@ -197,19 +227,10 @@ def _load_from_hdf5(hdf5_path: Path) -> FlatData:
         if 'umap_maprange' in f:
             parameters['umap_maprange'] = f['umap_maprange'][:]
         
-        # Load embeddings (PCA) if present
+        # Load embeddings PCA if present (legacy format in embeddings group)
         if 'embeddings' in f and 'pca' in f['embeddings']:
             pca_data = f['embeddings/pca'][:]
-            # Create PC DataFrame
-            pc_cols = [f'pc_{i}' for i in range(pca_data.shape[1])]
-            pc_df = pd.DataFrame(pca_data, columns=pc_cols)
-            
-            # Drop existing PC columns from segments if they collide
-            cols_to_drop = [c for c in pc_cols if c in segments.columns]
-            if cols_to_drop:
-                segments = segments.drop(columns=cols_to_drop)
-                
-            segments = pd.concat([segments, pc_df], axis=1)
+            segments['pca'] = [row for row in pca_data]
         
         # Ensure cluster_id exists
         if 'cluster_id' not in segments.columns:
@@ -308,7 +329,10 @@ def save_to_hdf5(data: FlatData, output_path: str, compress: bool = True) -> Non
                 continue
             
             arr = data.segments[col].values
-            if arr.dtype == object:
+            # Handle columns containing arrays (umap, pca)
+            if arr.dtype == object and len(arr) > 0 and isinstance(arr[0], np.ndarray):
+                arr = np.stack(arr)
+            elif arr.dtype == object:
                 arr = arr.astype('S')
             seg_grp.create_dataset(col, data=arr, compression=compression)
             saved_cols.add(col)
@@ -359,6 +383,15 @@ def save_to_hdf5(data: FlatData, output_path: str, compress: bool = True) -> Non
             key = str(file_id)
             if key not in spec_grp:
                 spec_grp.create_dataset(key, data=spec, compression=compression)
+        
+        # Copy embeddings from source HDF5 if available
+        if data.hdf5_path is not None and data.hdf5_path != output_path:
+            with h5py.File(data.hdf5_path, 'r') as src:
+                if 'embeddings' in src:
+                    emb_grp = f.create_group('embeddings')
+                    for key in src['embeddings'].keys():
+                        data_arr = src['embeddings'][key][:]
+                        emb_grp.create_dataset(key, data=data_arr, compression=compression)
         
         # Save UMAP maprange if available
         if 'umap_maprange' in data.parameters and 'umap_maprange' not in f:

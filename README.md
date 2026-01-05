@@ -13,8 +13,9 @@ This repository contains two main components:
 
 ### Preprocessing Pipeline
 - **Spectrogram computation** - Convert audio to spectrograms using librosa
+- **Pitch extraction** - Extract pitch contours from audio files using Parselmouth (Praat)
 - **Segmentation** - Detect vocalizations using [WhisperSeg](https://github.com/nianlonggu/WhisperSeg)
-- **Embedding extraction** - Generate neural embeddings for each vocalization
+- **Embedding extraction** - Generate neural embeddings for each vocalization using Whisper
 - **UMAP projection** - Reduce embedding dimensionality for visualization
 - **HDF5 export** - Package everything for the clustering app
 
@@ -29,7 +30,7 @@ This repository contains two main components:
 - **Multiple Sort Modes**: Timestamp, duration, random, nearest-neighbor chain, outlier-first
 - **HDF5 Export/Import**: Save and reload your work
 
----
+---   
 
 ## Installation
 
@@ -190,21 +191,31 @@ data.h5
 │   ├── file_id                  # Which source file
 │   ├── onset_sec                # Segment start time (seconds)
 │   ├── duration_sec             # Segment duration (seconds)
-│   ├── onset_sample             # Start sample index
-│   ├── duration_samples         # Duration in samples
-│   ├── umap_x, umap_y           # UMAP coordinates
-│   ├── cluster_id               # Cluster assignment
-│   └── pc_0, pc_1, ...          # PCA components
+│   ├── umap                     # UMAP coordinates (n_segments, 2)
+│   ├── pca                      # PCA coordinates (n_segments, n_components)
+│   └── cluster_id               # Cluster assignment
 ├── files/                       # Source file metadata
+│   ├── file_id                  # File index (matches segments/file_id)
 │   └── path                     # File paths
-├── embeddings/                  # Raw embeddings
-│   └── raw                      # Full embedding vectors
+├── embeddings/                  # Embedding vectors
+│   ├── segment_id               # Segment index (matches segments/segment_id)
+│   └── raw                      # Full embedding vectors (n_segments, 1280)
 ├── spectrograms/                # Spectrogram data
-│   ├── 0                        # Full spectrogram for file 0
-│   ├── 1                        # Full spectrogram for file 1
+│   ├── file_id                  # List of file IDs with spectrograms
+│   ├── 0                        # Spectrogram for file_id=0
+│   ├── 1                        # Spectrogram for file_id=1
 │   └── ...
-├── parameters/                  # Processing parameters
-│   └── attrs: scanrate, nonoverlap, ...
+├── parameters/                  # Processing parameters (organized by step)
+│   └── attrs:
+│       ├── subject, data_dir, output_dir, device
+│       ├── audio_sr, spec_n_fft, spec_hop_length, spec_min_freq, spec_max_freq
+│       ├── pitch_floor
+│       ├── seg_model, seg_min_freq, seg_time_step, seg_min_length, seg_eps, seg_num_trials
+│       ├── emb_model, emb_min_freq, emb_time_step, emb_num_trials, emb_style, emb_batch_size
+│       ├── umap_n_neighbors, umap_train_percentage
+│       ├── pca_n_components
+│       ├── sr_processing, sr_original  # Derived parameters
+│       └── ...
 └── umap_maprange               # UMAP axis limits
 ```
 

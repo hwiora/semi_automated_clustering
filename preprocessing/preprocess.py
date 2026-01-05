@@ -120,8 +120,8 @@ Examples:
                         help='Fraction of data to use for UMAP fitting (default: 1.0)')
     
     # HDF5 export parameters
-    parser.add_argument('--n-pca', type=int, default=10,
-                        help='Number of PCA components to include (default: 10)')
+    parser.add_argument('--n-pca', type=int, default=100,
+                        help='Number of PCA components to include (default: 100)')
     parser.add_argument('--hdf5-output', type=str, default=None,
                         help='Custom HDF5 output path (default: {output_dir}/{subject}.h5)')
     
@@ -278,6 +278,7 @@ Examples:
             n_pca_components=args.n_pca,
             embedding_style=args.embedding_style,
             n_neighbors=args.n_neighbors,
+            all_args=args,  # Pass all arguments for reproducibility
         )
         step_num += 1
         print()
