@@ -18,7 +18,7 @@ from preprocessing_utils import get_all_days, get_day_string
 
 def export_to_hdf5(subject_name, data_dir, spectrograms_dir, segmentation_dir, 
                    embedding_dir, umap_dir, output_path, 
-                   sr=32000, hop_length=128, n_pca_components=10,
+                   sr=32000, hop_length=128, n_pca_components=100,
                    embedding_style='first_timebin', n_neighbors=100):
     """Export all preprocessing results to HDF5 format for clustering_app.
     
