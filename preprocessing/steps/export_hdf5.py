@@ -157,9 +157,10 @@ def export_to_hdf5(subject_name, data_dir, spectrograms_dir, segmentation_dir,
         # Create files group
         files_grp = f.create_group('files')
         files_grp.create_dataset('file_id', data=np.arange(len(file_paths), dtype=np.int32))
-        # Convert paths to bytes for HDF5
-        path_bytes = np.array([p.encode('utf-8') for p in file_paths], dtype='S')
-        files_grp.create_dataset('path', data=path_bytes)
+        # Store only filenames (not full paths)
+        filenames = [os.path.basename(p) for p in file_paths]
+        filename_bytes = np.array([fn.encode('utf-8') for fn in filenames], dtype='S')
+        files_grp.create_dataset('filename', data=filename_bytes)
         
         # Create embeddings group (raw embeddings only, PCA is in segments/pc_*)
         emb_grp = f.create_group('embeddings')
