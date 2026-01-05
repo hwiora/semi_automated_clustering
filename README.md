@@ -196,7 +196,7 @@ data.h5
 │   └── cluster_id               # Cluster assignment
 ├── files/                       # Source file metadata
 │   ├── file_id                  # File index (matches segments/file_id)
-│   └── path                     # File paths
+│   └── filename                 # File names
 ├── embeddings/                  # Embedding vectors
 │   ├── segment_id               # Segment index (matches segments/segment_id)
 │   └── raw                      # Full embedding vectors (n_segments, 1280)
