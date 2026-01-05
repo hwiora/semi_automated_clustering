@@ -223,7 +223,7 @@ data.h5
 
 ## Example Data
 
-Sample data is available on Zenodo: https://doi.org/10.5281/zenodo.18100613
+Sample data is available on Zenodo: https://doi.org/10.5281/zenodo.18156254
 
 ---
 
