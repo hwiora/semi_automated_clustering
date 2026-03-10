@@ -23,7 +23,10 @@ def spec_to_int8(spec_in_float):
     Returns:
         Spectrogram normalized and converted to int8.
     """
-    normalized_spec = spec_in_float / np.max(np.abs(spec_in_float))
+    max_abs = np.max(np.abs(spec_in_float))
+    if max_abs == 0:
+        return np.zeros_like(spec_in_float, dtype=np.int8)
+    normalized_spec = spec_in_float / max_abs
     spec_in_int8 = (normalized_spec * 127).astype(np.int8)
     return spec_in_int8
 
@@ -79,7 +82,7 @@ def compute_spectrograms(subject_name, data_dir, output_dir,
             D = D[f_window, :]
             
             timepoints_spec.append(t)
-            frequencies_spec.append(f)
+            frequencies_spec.append(f[f_window])
             spectrograms.append(D)
             wav_fnames.append(wav_path)
         

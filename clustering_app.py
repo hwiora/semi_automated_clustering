@@ -10,6 +10,9 @@ Keyboard Controls:
     u       : Merge another cluster into current cluster (dialog)
     o       : Select sorting mode (dialog)
     c       : Cycle modes (CLUSTERING → BLOBBING → PROOFREADING → CLUSTERING)
+    p       : Toggle cluster pitch trajectory figure
+    v       : Toggle context view around vocalizations
+    z       : Reset UMAP zoom to full view
     Shift+C : Reset all clusters
     x       : Export to HDF5 file
     q       : Quit
@@ -18,7 +21,7 @@ Keyboard Controls:
 import argparse
 import numpy as np
 import tkinter as tk
-from tkinter import filedialog
+from tkinter import filedialog, simpledialog
 import matplotlib
 matplotlib.use('TkAgg')  # Use TkAgg backend to avoid Qt event loop issues
 import matplotlib.pyplot as plt
@@ -32,6 +35,8 @@ plt.rcParams['keymap.pan'] = []         # Was 'p'
 plt.rcParams['keymap.zoom'] = []        # Was 'o'
 from matplotlib.colors import ListedColormap
 from matplotlib.gridspec import GridSpec
+from matplotlib.widgets import Button
+from scipy.spatial import cKDTree
 from pathlib import Path
 from typing import Optional, List, Dict, Set
 
@@ -48,11 +53,23 @@ except ImportError:
 class ClusteringApp:
     """Interactive UMAP clustering application."""
     
-    def __init__(self, data: FlatData):
+    def __init__(self, data: FlatData, preload_override: Optional[bool] = None):
         self.data = data
         
         umap_params = data.parameters.get('umap', {})
         self.n_pixels = umap_params.get('num_pixels', 1200)
+        self.max_scatter_points = int(umap_params.get('max_scatter_points', 200000))
+        self.pitch_plot_sample_limit = int(umap_params.get('pitch_plot_sample_limit', 500))
+        self.pitch_plot_point_limit = int(umap_params.get('pitch_plot_point_limit', 200000))
+        self.pitch_view_enabled = False
+        self.context_view_enabled = False
+        self.context_seconds = float(umap_params.get('context_seconds', 1.0))
+        preload_default = bool(umap_params.get('preload_all_spectrograms', True))
+        self.preload_all_spectrograms = preload_default if preload_override is None else bool(preload_override)
+        self.pitch_ylim_enabled = False
+        self.pitch_ylim = None
+        self.umap_view_locked = False
+        self.umap_view_limits = None
         
         self.detector = BlobDetector(
             n_pixels=self.n_pixels,
@@ -119,9 +136,19 @@ class ClusteringApp:
         
         # Track active figure for scrolling (33 or 34)
         self.active_figure: int = 33  # Default to Fig33
-        
-        # Pre-cache all spectrograms for faster updates
-        self.data.precache_all_spectrograms()
+
+        # Column snapshots for faster repeated access
+        self._onset_sec = self.data.segments['onset_sec'].to_numpy(dtype=np.float32, copy=False)
+        self._duration_sec = self.data.segments['duration_sec'].to_numpy(dtype=np.float32, copy=False)
+        if 'pitch_hz' in self.data.segments.columns:
+            self._segment_pitch_hz = self.data.segments['pitch_hz'].to_numpy(dtype=np.float32, copy=False)
+        else:
+            self._segment_pitch_hz = None
+
+        # Tradeoff mode requested by user: slower startup, faster interactions
+        if self.preload_all_spectrograms:
+            self.data.max_segment_spec_cache = max(self.data.max_segment_spec_cache, self.data.n_segments)
+            self.data.precache_all_spectrograms(max_segments=self.data.n_segments)
         
         self._setup_figures()
         self._update_blobs()
@@ -182,16 +209,176 @@ class ClusteringApp:
             self.fig_clusters.canvas.manager.window.wm_geometry("+850+500")
         except:
             pass
+
+        # Cluster pitch trajectory figure (toggle with 'p')
+        self.fig_pitch, self.ax_pitch = plt.subplots(figsize=(8, 3), num="Cluster Pitch")
+        self.fig_pitch.canvas.mpl_connect('key_press_event', self._on_key_press)
+        self._pitch_btn_ax = self.fig_pitch.add_axes([0.84, 0.83, 0.14, 0.14])
+        self._pitch_ylim_btn = Button(self._pitch_btn_ax, 'Y-Lim')
+        self._pitch_ylim_btn.on_clicked(self._on_pitch_ylim_button)
+        try:
+            self.fig_pitch.canvas.manager.window.wm_geometry("+0+860")
+        except:
+            pass
+
+        # Context Viewer: vertical context spectrograms for current Fig20 segments
+        self.fig_context = plt.figure(figsize=(10, 8), num="Context Viewer")
+        self.fig_context.canvas.mpl_connect('key_press_event', self._on_key_press)
+        try:
+            self.fig_context.canvas.manager.window.wm_geometry("+1200+0")
+        except:
+            pass
         
         # Colormap
         n_colors = 31
         colors = np.zeros((n_colors, 4))
         colors[0] = [0.0, 0.0, 0.3, 1.0]
-        colors[1:] = plt.cm.jet(np.linspace(0, 1, n_colors - 1))
+        tab20 = plt.cm.tab20(np.linspace(0, 1, min(20, n_colors - 1)))
+        if n_colors - 1 > 20:
+            rest = plt.cm.hsv(np.linspace(0, 1, (n_colors - 1) - 20, endpoint=False))
+            colors[1:] = np.vstack([tab20, rest])
+        else:
+            colors[1:] = tab20[:n_colors - 1]
         self.blob_cmap = ListedColormap(colors)
         
         # Initialize Cluster Grid with existing clusters
         self._update_cluster_visualizer()
+        self._update_pitch_figure()
+        self._update_context_viewer([])
+
+    def _downsample_indices(self, indices: np.ndarray, max_points: int) -> np.ndarray:
+        """Downsample index arrays for responsive plotting on large datasets."""
+        if len(indices) <= max_points:
+            return indices
+        step = max(1, len(indices) // max_points)
+        sampled = indices[::step]
+        if len(sampled) > max_points:
+            sampled = sampled[:max_points]
+        return sampled
+
+    def _get_cluster_segment_indices(self, cluster_id: int) -> np.ndarray:
+        """Return segment indices belonging to a cluster ID."""
+        cluster_vals = self.data.segments['cluster_id'].to_numpy(dtype=np.int32, copy=False)
+        return np.flatnonzero(cluster_vals == int(cluster_id))
+
+    def _update_pitch_figure(self) -> None:
+        """Update optional cluster-level pitch scatter plot."""
+        self.ax_pitch.clear()
+
+        if not self.pitch_view_enabled:
+            self.ax_pitch.text(0.5, 0.5, "Pitch view OFF (press 'p')", ha='center', va='center')
+            self.ax_pitch.set_title("Cluster Pitch")
+            self.ax_pitch.set_xticks([])
+            self.ax_pitch.set_yticks([])
+            self.fig_pitch.canvas.draw_idle()
+            return
+
+        cluster_id = None
+        seg_indices = None
+        if self.app_mode == 'BLOBBING' and len(self.fig20_segments) > 0:
+            seg_indices = np.asarray(self.fig20_segments, dtype=np.int32)
+        else:
+            if self.fig34_current_cluster is not None:
+                cluster_id = int(self.fig34_current_cluster)
+            elif self.selected_segment is not None:
+                cluster_id = int(self.data.segments.iloc[self.selected_segment]['cluster_id'])
+
+            if cluster_id is not None:
+                seg_indices = self._get_cluster_segment_indices(cluster_id)
+
+        if seg_indices is None:
+            self.ax_pitch.text(0.5, 0.5, "No cluster selected", ha='center', va='center')
+            self.ax_pitch.set_title("Cluster Pitch")
+            self.ax_pitch.set_xticks([])
+            self.ax_pitch.set_yticks([])
+            self.fig_pitch.canvas.draw_idle()
+            return
+
+        if len(seg_indices) == 0:
+            if cluster_id is None:
+                self.ax_pitch.text(0.5, 0.5, "Current view is empty", ha='center', va='center')
+                self.ax_pitch.set_title("Pitch Scatter")
+            else:
+                self.ax_pitch.text(0.5, 0.5, f"Cluster C{cluster_id} is empty", ha='center', va='center')
+                self.ax_pitch.set_title("Cluster Pitch")
+            self.ax_pitch.set_xticks([])
+            self.ax_pitch.set_yticks([])
+            self.fig_pitch.canvas.draw_idle()
+            return
+
+        seg_indices = np.sort(np.unique(seg_indices))
+
+        if self._segment_pitch_hz is not None:
+            pitch_vals = self._segment_pitch_hz[seg_indices]
+        else:
+            # Backward compatibility for older HDF5 files without segment-level pitch
+            pitch_vals = np.full(len(seg_indices), np.nan, dtype=np.float32)
+            for i, seg_id in enumerate(seg_indices):
+                pitch = self.data.get_segment_pitch(int(seg_id), context_sec=0.0)
+                if pitch is None:
+                    continue
+                _t_seg, f0_seg = pitch
+                valid_f0 = np.logical_and(np.isfinite(f0_seg), f0_seg > 0)
+                if np.any(valid_f0):
+                    pitch_vals[i] = float(np.median(f0_seg[valid_f0]))
+
+        onset_vals = self._onset_sec[seg_indices]
+        valid = np.logical_and(np.isfinite(pitch_vals), pitch_vals > 0)
+
+        if not np.any(valid):
+            self.ax_pitch.text(0.5, 0.5, "No pitch data available for selected cluster", ha='center', va='center')
+            title = "Pitch Scatter (Current View)" if cluster_id is None else f"Cluster Pitch (C{cluster_id})"
+            self.ax_pitch.set_title(title)
+            self.ax_pitch.set_xticks([])
+            self.ax_pitch.set_yticks([])
+            self.fig_pitch.canvas.draw_idle()
+            return
+
+        x = onset_vals[valid]
+        y = pitch_vals[valid]
+
+        self.ax_pitch.scatter(x, y, s=8, alpha=0.35, linewidths=0)
+        self.ax_pitch.set_xlabel('Onset time (s)')
+        self.ax_pitch.set_ylabel('Pitch (Hz)')
+        if cluster_id is None:
+            self.ax_pitch.set_title(f"Pitch Scatter Current View | seg={len(seg_indices)} | pts={len(x)}")
+        else:
+            self.ax_pitch.set_title(f"Cluster Pitch Scatter C{cluster_id} | seg={len(seg_indices)} | pts={len(x)}")
+
+        if self.pitch_ylim_enabled and self.pitch_ylim is not None:
+            self.ax_pitch.set_ylim(self.pitch_ylim[0], self.pitch_ylim[1])
+        self.fig_pitch.canvas.draw_idle()
+
+    def _on_pitch_ylim_button(self, _event) -> None:
+        """Toggle manual y-limits for pitch scatter and prompt for bounds."""
+        if self.pitch_ylim_enabled:
+            self.pitch_ylim_enabled = False
+            self.pitch_ylim = None
+            print("Pitch y-limits: AUTO")
+            self._update_pitch_figure()
+            return
+
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            y_min = simpledialog.askfloat("Pitch Y-Lim", "Min pitch (Hz):", parent=root)
+            y_max = simpledialog.askfloat("Pitch Y-Lim", "Max pitch (Hz):", parent=root)
+            root.destroy()
+        except Exception as e:
+            print(f"Pitch y-limit dialog error: {e}")
+            return
+
+        if y_min is None or y_max is None:
+            print("Pitch y-limit change cancelled.")
+            return
+        if y_max <= y_min:
+            print("Invalid pitch limits: max must be greater than min.")
+            return
+
+        self.pitch_ylim_enabled = True
+        self.pitch_ylim = (float(y_min), float(y_max))
+        print(f"Pitch y-limits: [{y_min:.1f}, {y_max:.1f}] Hz")
+        self._update_pitch_figure()
     
     def _get_active_umap_coords(self) -> tuple:
         """Get UMAP coords excluding assigned segments."""
@@ -223,8 +410,18 @@ class ClusteringApp:
         self.detector.update_radius_only()
         self._update_display()
     
-    def _update_display(self) -> None:
+    def _update_display(self, capture_zoom: bool = True) -> None:
         """Update UMAP Scatter."""
+        if capture_zoom and self.ax_umap.has_data():
+            prev_xlim = self.ax_umap.get_xlim()
+            prev_ylim = self.ax_umap.get_ylim()
+            if self._is_zoomed_view(prev_xlim, prev_ylim):
+                self.umap_view_locked = True
+                self.umap_view_limits = (prev_xlim, prev_ylim)
+            else:
+                self.umap_view_locked = False
+                self.umap_view_limits = None
+
         self.ax_umap.clear()
         umap_coords = self.data.umap_coords
         
@@ -235,24 +432,52 @@ class ClusteringApp:
             extent = [mr[0, 0], mr[1, 0], mr[0, 1], mr[1, 1]]
             self.ax_umap.imshow(
                 self.detector.blob_image, origin='lower', extent=extent,
-                cmap=self.blob_cmap, interpolation='nearest', vmin=0, vmax=30
+                cmap=self.blob_cmap, interpolation='nearest', vmin=0, vmax=30, alpha=0.95
             )
         
         if self.app_mode == 'BLOBBING':
             # BLOBBING: Assigned = gray, Active = white
             if self.assigned_segment_indices:
-                assigned_coords = umap_coords[list(self.assigned_segment_indices)]
+                assigned_idx = np.array(list(self.assigned_segment_indices), dtype=np.int32)
+                assigned_idx = self._downsample_indices(assigned_idx, self.max_scatter_points)
+                assigned_coords = umap_coords[assigned_idx]
                 self.ax_umap.scatter(assigned_coords[:, 0], assigned_coords[:, 1],
-                                    c='gray', s=5, alpha=0.6)
+                                    c='#c8c8c8', s=4, alpha=0.35, rasterized=True)
             
             active_coords, _ = self._get_active_umap_coords()
             if len(active_coords) > 0:
+                if len(active_coords) > self.max_scatter_points:
+                    active_idx = np.arange(len(active_coords), dtype=np.int32)
+                    active_idx = self._downsample_indices(active_idx, self.max_scatter_points)
+                    active_coords = active_coords[active_idx]
                 self.ax_umap.scatter(active_coords[:, 0], active_coords[:, 1],
-                                    c='white', s=3, alpha=0.8)
+                                    c='white', s=2, alpha=0.45, rasterized=True)
+        elif self.app_mode == 'CLUSTERING':
+            # CLUSTERING: color by cluster id for interpretability
+            cluster_vals = self.data.segments['cluster_id'].to_numpy(dtype=np.int32, copy=False)
+            if len(umap_coords) > self.max_scatter_points:
+                full_idx = np.arange(len(umap_coords), dtype=np.int32)
+                full_idx = self._downsample_indices(full_idx, self.max_scatter_points)
+                coords_plot = umap_coords[full_idx]
+                clusters_plot = cluster_vals[full_idx]
+            else:
+                coords_plot = umap_coords
+                clusters_plot = cluster_vals
+
+            self.ax_umap.scatter(
+                coords_plot[:, 0], coords_plot[:, 1],
+                c=clusters_plot, cmap='tab20', s=3, alpha=0.65, rasterized=True
+            )
         else:
-            # PROOFREADING/CLUSTERING: All points white
-            self.ax_umap.scatter(umap_coords[:, 0], umap_coords[:, 1],
-                                c='white', s=3, alpha=0.8)
+            # PROOFREADING: neutral view
+            if len(umap_coords) > self.max_scatter_points:
+                full_idx = np.arange(len(umap_coords), dtype=np.int32)
+                full_idx = self._downsample_indices(full_idx, self.max_scatter_points)
+                coords_plot = umap_coords[full_idx]
+            else:
+                coords_plot = umap_coords
+            self.ax_umap.scatter(coords_plot[:, 0], coords_plot[:, 1],
+                                c='white', s=2, alpha=0.45, rasterized=True)
         
         # Selected
         if self.selected_segment is not None:
@@ -265,15 +490,22 @@ class ClusteringApp:
         self.ax_umap.set_xlabel("UMAP 1")
         self.ax_umap.set_ylabel("UMAP 2")
         
-        # Gray out UMAP Scatter in non-BLOBBING modes
+        # Facecolor by mode
         if self.app_mode == 'BLOBBING':
             self.ax_umap.set_facecolor((0.0, 0.0, 0.3))
+        elif self.app_mode == 'CLUSTERING':
+            self.ax_umap.set_facecolor((0.05, 0.05, 0.08))
+            self.ax_umap.set_title(f"[{self.app_mode}]")
         else:
             self.ax_umap.set_facecolor((0.2, 0.2, 0.2))  # Grayed out
             self.ax_umap.set_title(f"{mode_str} (View Only)")
         
         # Set axis limits to match maprange to prevent clipping
-        if self.maprange is not None:
+        if self.umap_view_locked and self.umap_view_limits is not None:
+            xlim, ylim = self.umap_view_limits
+            self.ax_umap.set_xlim(xlim[0], xlim[1])
+            self.ax_umap.set_ylim(ylim[0], ylim[1])
+        elif self.maprange is not None:
             self.ax_umap.set_xlim(self.maprange[0, 0], self.maprange[1, 0])
             self.ax_umap.set_ylim(self.maprange[0, 1], self.maprange[1, 1])
         
@@ -285,10 +517,10 @@ class ClusteringApp:
             return segment_indices
         
         if self.fig20_sort_mode == 'timestamp':
-            onsets = self.data.segments.iloc[segment_indices]['onset_sec'].values
+            onsets = self._onset_sec[segment_indices]
             return segment_indices[np.argsort(onsets)]
         elif self.fig20_sort_mode == 'duration':
-            durations = self.data.segments.iloc[segment_indices]['duration_sec'].values
+            durations = self._duration_sec[segment_indices]
             return segment_indices[np.argsort(durations)]
         elif self.fig20_sort_mode == 'random':
             return np.random.permutation(segment_indices)
@@ -301,6 +533,15 @@ class ClusteringApp:
         elif self.fig20_sort_mode == 'nn_outlier_pc':
             return self._nn_outlier_sort(segment_indices, 'pc')
         return segment_indices
+
+    def _is_nn_sort_mode(self) -> bool:
+        """Return True when sort mode uses nearest-neighbor distance computation."""
+        return self.fig20_sort_mode in {
+            'nn_chain_umap',
+            'nn_chain_pc',
+            'nn_outlier_umap',
+            'nn_outlier_pc',
+        }
     
     def _get_coords(self, segment_indices: np.ndarray, space: str) -> np.ndarray:
         """Get coordinates for segments in specified space."""
@@ -318,10 +559,24 @@ class ClusteringApp:
         if len(segment_indices) <= 1:
             return segment_indices
         
-        coords = self._get_coords(segment_indices, space)
+        coords = np.asarray(self._get_coords(segment_indices, space), dtype=np.float32)
         n = len(segment_indices)
         visited = np.zeros(n, dtype=bool)
         order = []
+
+        use_approx = n > 5000
+        approx_eps = 0.2
+        tree = cKDTree(coords) if use_approx else None
+        k_primary = min(64, n)
+        k_secondary = min(512, n)
+
+        def _first_unvisited_from_query(query_indices, cur_idx):
+            q = np.atleast_1d(query_indices)
+            for cand in q:
+                cand_idx = int(cand)
+                if cand_idx != cur_idx and not visited[cand_idx]:
+                    return cand_idx
+            return None
         
         # Start with first element
         current = 0
@@ -330,10 +585,28 @@ class ClusteringApp:
             visited[current] = True
             
             if len(order) < n:
-                # Find nearest unvisited
-                distances = np.sum((coords - coords[current])**2, axis=1)
-                distances[visited] = np.inf
-                current = np.argmin(distances)
+                next_idx = None
+
+                if use_approx:
+                    _, nn_idx = tree.query(coords[current], k=k_primary, eps=approx_eps)
+                    next_idx = _first_unvisited_from_query(nn_idx, current)
+
+                    if next_idx is None and k_secondary > k_primary:
+                        _, nn_idx2 = tree.query(coords[current], k=k_secondary, eps=approx_eps)
+                        next_idx = _first_unvisited_from_query(nn_idx2, current)
+
+                    if next_idx is None:
+                        remaining = np.flatnonzero(~visited)
+                        if len(remaining) == 0:
+                            break
+                        next_idx = int(remaining[0])
+                else:
+                    # Exact nearest unvisited for smaller groups
+                    distances = np.sum((coords - coords[current])**2, axis=1)
+                    distances[visited] = np.inf
+                    next_idx = int(np.argmin(distances))
+
+                current = next_idx
         
         return segment_indices[order]
     
@@ -342,19 +615,23 @@ class ClusteringApp:
         if len(segment_indices) <= 1:
             return segment_indices
         
-        coords = self._get_coords(segment_indices, space)
+        coords = np.asarray(self._get_coords(segment_indices, space), dtype=np.float32)
         n = len(segment_indices)
         
-        # Compute pairwise distances
-        # For each point, sum distances to k nearest neighbors
         k = min(k, n - 1)  # Can't have more neighbors than points
-        
-        # Compute all pairwise distances
-        dist_matrix = np.sqrt(np.sum((coords[:, None, :] - coords[None, :, :])**2, axis=2))
-        
-        # Sort each row and sum k smallest (excluding self at 0)
-        sorted_dists = np.sort(dist_matrix, axis=1)
-        nn_sums = np.sum(sorted_dists[:, 1:k+1], axis=1)  # Skip first (self distance = 0)
+
+        # For very large groups, allow approximate kNN to keep interaction fast.
+        approx_eps = 0.2 if n > 5000 else 0.0
+
+        # Memory-safe kNN distances using KD-tree (avoids O(n^2) distance matrix).
+        # Query k+1 because nearest neighbor is the point itself (distance 0).
+        tree = cKDTree(coords)
+        dists, _ = tree.query(coords, k=k + 1, eps=approx_eps)
+
+        if np.ndim(dists) == 1:
+            dists = dists[:, None]
+
+        nn_sums = np.sum(dists[:, 1:k+1], axis=1)
         
         # Sort by sum: smallest sum = most typical (first), largest sum = outlier (last)
         order = np.argsort(nn_sums)
@@ -366,8 +643,7 @@ class ClusteringApp:
             return
         
         start = self.fig20_offset
-        remaining_segs = self.fig20_segments[start:]
-        if not remaining_segs:
+        if start >= len(self.fig20_segments):
             return
         
         # Calculate how many segments fit using SpectrogramViewer.FIXED_WIDTH_PER_COL
@@ -375,23 +651,54 @@ class ClusteringApp:
         AVAILABLE_WIDTH = 0.94  # Leave some margin
         GAP = 0.003
         MAX_COLS = int(AVAILABLE_WIDTH / SpectrogramViewer.FIXED_WIDTH_PER_COL)
+        MAX_SPECS_DISPLAY = 50
+        MAX_SCAN = 2000
         
-        # Get column counts for remaining segments
-        col_counts = []
-        for seg_id in remaining_segs:
-            spec = self.data.get_segment_spectrogram(seg_id)
-            col_counts.append(spec.shape[1] if spec is not None and spec.size > 0 else 0)
-        
-        # Find how many segments fit in available width
-        cumsum = np.cumsum(col_counts)
-        n_display = np.searchsorted(cumsum, MAX_COLS) + 1
-        n_display = max(4, min(n_display, 50))  # Clamp to 4-50 range
-        
-        end = min(start + n_display, len(self.fig20_segments))
-        display_segs = self.fig20_segments[start:end]
+        # Build only one page worth of segments (fast even for very large groups)
+        # Keep Fig20 pagination context-independent so toggling context does not
+        # collapse to one segment due inflated widths.
+        context_sec = 0.0
+        display_segs = []
+        total_cols = 0
+        idx = start
+        scanned = 0
+
+        while idx < len(self.fig20_segments) and len(display_segs) < MAX_SPECS_DISPLAY and scanned < MAX_SCAN:
+            seg_id = self.fig20_segments[idx]
+            spec = self.data.get_segment_spectrogram(seg_id, context_sec=context_sec)
+            if (spec is None or spec.size == 0) and context_sec > 0:
+                spec = self.data.get_segment_spectrogram(seg_id, context_sec=0.0)
+            cols = spec.shape[1] if spec is not None and spec.size > 0 else 0
+            scanned += 1
+
+            if cols <= 0:
+                idx += 1
+                continue
+
+            if len(display_segs) > 0 and (total_cols + cols) > MAX_COLS:
+                # Skip oversized candidates and continue scanning so one long
+                # segment doesn't block all following shorter segments.
+                idx += 1
+                continue
+
+            display_segs.append(seg_id)
+            total_cols += cols
+            idx += 1
+
+        end = start + len(display_segs)
+        if end <= start:
+            self._update_context_viewer([])
+            return
         
         # Display spectrograms - viewer uses same FIXED_WIDTH_PER_COL
         self.spec_viewer.display_with_highlight(display_segs, self.fig20_selected)
+
+        # If no axes were created (e.g., missing spectrograms), show an explicit message
+        if not getattr(self.spec_viewer, '_segment_axes', {}):
+            self.fig_spec.clear()
+            self.fig_spec.text(0.5, 0.5,
+                               'No spectrogram slices available for selected segments',
+                               ha='center', va='center', fontsize=11)
         
         # Set title AFTER display (since display clears the figure)
         if self.fig34_current_cluster:
@@ -409,10 +716,180 @@ class ClusteringApp:
             sort_desc = self.fig20_sort_mode
         
         self.fig_spec.suptitle(f"{group_str} | Sort: {sort_desc} | "
-                               f"[{start+1}-{end}/{len(self.fig20_segments)}]", fontsize=10)
+                               f"[{start+1}-{end}/{len(self.fig20_segments)}] | "
+                               f"Context: {'ON' if self.context_view_enabled else 'OFF'}", fontsize=10)
         
         self.fig_spec.canvas.draw_idle()
         self.fig_spec.canvas.flush_events()
+        self._update_context_viewer(display_segs)
+
+    def _is_zoomed_view(self, xlim, ylim) -> bool:
+        """Return True when limits differ from the full maprange."""
+        if self.maprange is None:
+            return False
+        full_xlim = (self.maprange[0, 0], self.maprange[1, 0])
+        full_ylim = (self.maprange[0, 1], self.maprange[1, 1])
+        tol_x = max(1e-9, abs(full_xlim[1] - full_xlim[0]) * 1e-3)
+        tol_y = max(1e-9, abs(full_ylim[1] - full_ylim[0]) * 1e-3)
+        same_x = abs(xlim[0] - full_xlim[0]) <= tol_x and abs(xlim[1] - full_xlim[1]) <= tol_x
+        same_y = abs(ylim[0] - full_ylim[0]) <= tol_y and abs(ylim[1] - full_ylim[1]) <= tol_y
+        return not (same_x and same_y)
+
+    def _reset_umap_zoom(self) -> None:
+        """Reset persistent zoom and return to full maprange."""
+        self.umap_view_locked = False
+        self.umap_view_limits = None
+        self._update_display(capture_zoom=False)
+
+    def _get_aligned_context_spectrogram(self, seg_id: int, context_sec: float,
+                                         sr: float, hop_length: float):
+        """Return context spectrogram with boundary padding so onset stays aligned."""
+        row = self.data.segments.iloc[int(seg_id)]
+        file_id = int(row['file_id'])
+        onset_sec = float(row['onset_sec'])
+        duration_sec = float(row['duration_sec'])
+
+        if not (np.isfinite(onset_sec) and np.isfinite(duration_sec)) or duration_sec <= 0:
+            return None, 0, 0, False
+
+        full_spec = self.data.get_spectrogram(file_id)
+        if full_spec is None or full_spec.size == 0:
+            return None, 0, 0, False
+
+        n_cols_total = int(full_spec.shape[1])
+        if n_cols_total <= 0:
+            return None, 0, 0, False
+
+        onset_sample = int(onset_sec * sr)
+        duration_samples = int(duration_sec * sr)
+        context_samples = int(max(0.0, context_sec) * sr)
+
+        desired_start_sample = onset_sample - context_samples
+        desired_end_sample = onset_sample + duration_samples + context_samples
+
+        desired_start_col = int(np.floor(desired_start_sample / hop_length))
+        desired_end_col = int(np.floor(desired_end_sample / hop_length))
+        if desired_end_col <= desired_start_col:
+            desired_end_col = desired_start_col + 1
+
+        actual_start_col = max(0, desired_start_col)
+        actual_end_col = min(n_cols_total, desired_end_col)
+        if actual_end_col <= actual_start_col:
+            return None, 0, 0, False
+
+        spec = full_spec[:, actual_start_col:actual_end_col]
+
+        pad_left = max(0, -desired_start_col)
+        pad_right = max(0, desired_end_col - n_cols_total)
+        padded = (pad_left > 0) or (pad_right > 0)
+        if padded:
+            pad_value = int(np.min(full_spec))
+            spec = np.pad(spec, ((0, 0), (pad_left, pad_right)),
+                          mode='constant', constant_values=pad_value)
+
+        onset_col = int(round((max(0.0, context_sec) * sr) / hop_length))
+        dur_cols = max(1, int(round((duration_sec * sr) / hop_length)))
+        offset_col = onset_col + dur_cols
+
+        onset_col = int(np.clip(onset_col, 0, spec.shape[1] - 1))
+        offset_col = int(np.clip(offset_col, 0, spec.shape[1] - 1))
+        return spec, onset_col, offset_col, padded
+
+    def _update_context_viewer(self, segment_ids: List[int]) -> None:
+        """Show context spectrograms vertically for current Spectrogram Viewer selection."""
+        self.fig_context.clear()
+
+        if not self.context_view_enabled:
+            self.fig_context.text(0.5, 0.5, 'Context view OFF (press v)',
+                                  ha='center', va='center', fontsize=12)
+            self.fig_context.suptitle('Context Viewer')
+            self.fig_context.canvas.draw_idle()
+            return
+
+        if not segment_ids:
+            self.fig_context.text(0.5, 0.5, 'No segments selected',
+                                  ha='center', va='center', fontsize=12)
+            self.fig_context.suptitle('Context Viewer')
+            self.fig_context.canvas.draw_idle()
+            return
+
+        sr = float(self.data.scanrate)
+        hop_length = float(self.data.parameters.get(
+            'hop_length',
+            self.data.parameters.get('spec_hop_length', self.data.parameters.get('nonoverlap', 128))
+        ))
+        context_sec = float(self.context_seconds)
+        fallback_count = 0
+        padded_count = 0
+
+        max_rows = 10
+        n_input_rows = len(segment_ids)
+        segment_ids = segment_ids[:max_rows]
+        n_rows = len(segment_ids)
+        for row_idx, seg_id in enumerate(segment_ids):
+            ax = self.fig_context.add_subplot(n_rows, 1, row_idx + 1)
+            spec = None
+            onset_col = 0
+            offset_col = 0
+            used_context_sec = context_sec
+
+            if context_sec > 0:
+                spec, onset_col, offset_col, padded = self._get_aligned_context_spectrogram(
+                    int(seg_id), context_sec, sr, hop_length
+                )
+                if padded:
+                    padded_count += 1
+
+            if spec is None or spec.size == 0:
+                used_context_sec = 0.0
+                spec = self.data.get_segment_spectrogram(seg_id, context_sec=0.0)
+                if context_sec > 0:
+                    fallback_count += 1
+                seg_duration = float(self._duration_sec[int(seg_id)])
+                onset_col = 0
+                offset_col = int(round((seg_duration * sr) / hop_length))
+                if spec is not None and spec.size > 0:
+                    onset_col = int(np.clip(onset_col, 0, spec.shape[1] - 1))
+                    offset_col = int(np.clip(offset_col, 0, spec.shape[1] - 1))
+
+            if spec is None or spec.size == 0:
+                ax.text(0.5, 0.5, f'Segment {seg_id}: no context spectrogram',
+                        ha='center', va='center', transform=ax.transAxes, color='white')
+                ax.set_facecolor('black')
+                ax.set_xticks([])
+                ax.set_yticks([])
+                continue
+
+            ax.imshow(spec[::-1, :], aspect='auto', cmap='inferno', interpolation='nearest')
+
+            ax.axvline(onset_col, color='white', linestyle='--', linewidth=1.2)
+            ax.axvline(offset_col, color='white', linestyle='--', linewidth=1.2)
+            seg_label = str(seg_id)
+            if context_sec > 0 and used_context_sec == 0.0:
+                seg_label = f'{seg_id}*'
+            ax.set_ylabel(seg_label, rotation=0, ha='right', va='center', fontsize=7, color='white')
+            ax.set_yticks([])
+            if row_idx < n_rows - 1:
+                ax.set_xticks([])
+            else:
+                ax.set_xlabel('Time bins')
+
+        if fallback_count == 0:
+            title = f'Context Viewer (±{context_sec:.2f}s)'
+        elif fallback_count == n_rows:
+            title = f'Context Viewer (fallback to ±0.00s for all {n_rows} rows)'
+        else:
+            title = f'Context Viewer (±{context_sec:.2f}s, fallback to ±0.00s for {fallback_count}/{n_rows} rows)'
+
+        if context_sec > 0 and padded_count > 0:
+            title += f' | padded edges {padded_count}/{n_rows}'
+
+        if n_input_rows > max_rows:
+            title += f' | showing first {max_rows}/{n_input_rows} rows'
+
+        self.fig_context.suptitle(title)
+        self.fig_context.tight_layout(rect=[0, 0, 1, 0.98])
+        self.fig_context.canvas.draw_idle()
     
     def _update_blob_visualizer(self) -> None:
         """Update Blob/Precluster Grid with blobs (BLOBBING) or preclusters (PROOFREADING)."""
@@ -457,12 +934,17 @@ class ClusteringApp:
             segment_indices = data_to_show[group_id]
             # Use cached sorted segments, or create cache if missing
             if group_id not in self._fig33_sorted_cache:
-                self._fig33_sorted_cache[group_id] = self._sort_segments(segment_indices)
+                if self._is_nn_sort_mode():
+                    self._fig33_sorted_cache[group_id] = np.asarray(segment_indices, dtype=np.int32)
+                else:
+                    self._fig33_sorted_cache[group_id] = self._sort_segments(segment_indices)
             sorted_indices = self._fig33_sorted_cache[group_id]
             n_segs = min(len(sorted_indices), max_specs_per_row)
             if n_segs > 0:
-                durations = self.data.segments.iloc[sorted_indices[:n_segs]]['duration_sec'].values
-                total_dur = durations.sum()
+                durations = np.nan_to_num(self._duration_sec[sorted_indices[:n_segs]], nan=0.0, posinf=0.0, neginf=0.0)
+                total_dur = float(durations.sum())
+                if total_dur <= 0:
+                    continue
                 max_total_duration = max(max_total_duration, total_dur)
                 all_row_data[group_id] = (sorted_indices[:n_segs], durations, sorted_indices)
         
@@ -479,7 +961,9 @@ class ClusteringApp:
                 continue
             display_indices, durations, full_sorted_indices = row_data[group_id]
             n_segs = len(display_indices)
-            total_dur = durations.sum()
+            total_dur = float(np.sum(durations))
+            if total_dur <= 0:
+                continue
             row_width = (total_dur / max_total_duration) * available_width
             
             left = 0.07
@@ -495,12 +979,14 @@ class ClusteringApp:
             gap = 0.003  # Gap between spectrograms
             for col_idx in range(n_segs):
                 seg_id = display_indices[col_idx]
-                width = (durations[col_idx] / total_dur) * row_width
+                width = (float(durations[col_idx]) / total_dur) * row_width
+                if not np.isfinite(width) or width <= 0:
+                    continue
                 box_width = max(width - gap, 0.006)  # Minimum box size
                 
                 ax = self.fig_blobs.add_axes([x_pos, bottom, box_width, height])
                 
-                spec = self.data.get_segment_spectrogram(seg_id)
+                spec = self.data.get_segment_spectrogram(seg_id, context_sec=0.0)
                 if spec is not None and spec.size > 0:
                     ax.imshow(spec[::-1, :], aspect='auto', cmap='inferno', interpolation='nearest')
                 
@@ -529,15 +1015,9 @@ class ClusteringApp:
         
         # Build cluster assignments from data.segments['cluster_id']
         cluster_data = {}
-        for idx, row in self.data.segments.iterrows():
-            cid = int(row['cluster_id'])
-            if cid not in cluster_data:
-                cluster_data[cid] = []
-            cluster_data[cid].append(idx)
-        
-        # Convert to numpy arrays
-        for cid in cluster_data:
-            cluster_data[cid] = np.array(cluster_data[cid])
+        cluster_vals = self.data.segments['cluster_id'].to_numpy(dtype=np.int32, copy=False)
+        for cid in np.unique(cluster_vals):
+            cluster_data[int(cid)] = np.flatnonzero(cluster_vals == cid)
         
         if not cluster_data:
             self.fig_clusters.text(0.5, 0.5, "No clusters", ha='center', va='center', fontsize=14)
@@ -565,12 +1045,17 @@ class ClusteringApp:
             segment_indices = cluster_data[clust_id]
             # Use cached sorted segments, or create cache if missing
             if clust_id not in self._fig34_sorted_cache:
-                self._fig34_sorted_cache[clust_id] = self._sort_segments(segment_indices)
+                if self._is_nn_sort_mode():
+                    self._fig34_sorted_cache[clust_id] = np.asarray(segment_indices, dtype=np.int32)
+                else:
+                    self._fig34_sorted_cache[clust_id] = self._sort_segments(segment_indices)
             sorted_indices = self._fig34_sorted_cache[clust_id]
             n_segs = min(len(sorted_indices), max_specs_per_row)
             if n_segs > 0:
-                durations = self.data.segments.iloc[sorted_indices[:n_segs]]['duration_sec'].values
-                total_dur = durations.sum()
+                durations = np.nan_to_num(self._duration_sec[sorted_indices[:n_segs]], nan=0.0, posinf=0.0, neginf=0.0)
+                total_dur = float(durations.sum())
+                if total_dur <= 0:
+                    continue
                 max_total_duration = max(max_total_duration, total_dur)
                 all_row_data[clust_id] = (sorted_indices[:n_segs], durations, sorted_indices)
         
@@ -587,7 +1072,9 @@ class ClusteringApp:
                 continue
             display_indices, durations, full_sorted_indices = row_data[clust_id]
             n_segs = len(display_indices)
-            total_dur = durations.sum()
+            total_dur = float(np.sum(durations))
+            if total_dur <= 0:
+                continue
             row_width = (total_dur / max_total_duration) * available_width
             
             left = 0.07
@@ -603,14 +1090,16 @@ class ClusteringApp:
             gap = 0.003  # Gap between spectrograms
             for col_idx in range(n_segs):
                 seg_id = display_indices[col_idx]
-                width = (durations[col_idx] / total_dur) * row_width
+                width = (float(durations[col_idx]) / total_dur) * row_width
+                if not np.isfinite(width) or width <= 0:
+                    continue
                 box_width = max(width - gap, 0.006)  # Minimum box size
                 
                 ax = self.fig_clusters.add_axes([x_pos, bottom, box_width, height])
-                
-                spec = self.data.get_segment_spectrogram(seg_id)
+
+                spec = self.data.get_segment_spectrogram(seg_id, context_sec=0.0)
                 if spec is not None and spec.size > 0:
-                    ax.imshow(spec[::-1, :], aspect='auto', cmap='inferno', interpolation='nearest')
+                    ax.imshow(spec[::-1, :], aspect='auto', cmap='inferno', interpolation='bilinear')
                 
                 ax.set_xticks([])
                 ax.set_yticks([])
@@ -640,6 +1129,7 @@ class ClusteringApp:
             print(f">>> Selected segment {seg_id} (press 'm' to move)")
             self._update_fig20()
             self._update_display()  # Update UMAP with red circle
+            self._update_pitch_figure()
     
     def _on_fig33_click(self, event) -> None:
         if event.inaxes is None:
@@ -667,7 +1157,10 @@ class ClusteringApp:
                 self.fig34_current_cluster = None  # Clear cluster selection
                 # Use cached sorted segments (or create cache if missing)
                 if group_id not in self._fig33_sorted_cache:
-                    self._fig33_sorted_cache[group_id] = self._sort_segments(group_segments)
+                    if self._is_nn_sort_mode():
+                        self._fig33_sorted_cache[group_id] = np.asarray(group_segments, dtype=np.int32)
+                    else:
+                        self._fig33_sorted_cache[group_id] = self._sort_segments(group_segments)
                 self.fig20_segments = self._fig33_sorted_cache[group_id].tolist()
                 self.fig20_offset = 0
                 self.fig20_display_mode = 'sorted'  # Using sort mode
@@ -686,6 +1179,7 @@ class ClusteringApp:
             
             # Always update UMAP to show red circle
             self._update_display()
+            self._update_pitch_figure()
     
     def _on_fig34_click(self, event) -> None:
         """Handle click on Cluster Grid."""
@@ -709,7 +1203,10 @@ class ClusteringApp:
                 self.fig33_current_group = None  # Clear precluster selection
                 # Use cached sorted segments (or create cache if missing)
                 if clust_id not in self._fig34_sorted_cache:
-                    self._fig34_sorted_cache[clust_id] = self._sort_segments(cluster_segments)
+                    if self._is_nn_sort_mode():
+                        self._fig34_sorted_cache[clust_id] = np.asarray(cluster_segments, dtype=np.int32)
+                    else:
+                        self._fig34_sorted_cache[clust_id] = self._sort_segments(cluster_segments)
                 self.fig20_segments = self._fig34_sorted_cache[clust_id].tolist()
                 self.fig20_offset = 0
                 self.fig20_display_mode = 'sorted'  # Using sort mode
@@ -743,7 +1240,14 @@ class ClusteringApp:
         self.selected_segment = segment_id
         row = self.data.segments.iloc[segment_id]
         print(f"\n>>> Segment {segment_id}: File {int(row['file_id'])}, "
-              f"Onset {row['onset_sec']:.3f}s, C{int(row['cluster_id'])}")
+              f"Onset {row['onset_sec']:.3f}s, Dur {row['duration_sec']:.3f}s, C{int(row['cluster_id'])}")
+
+        # Diagnostic: nearest-neighbor distance in UMAP space (helps identify isolated outliers)
+        umap_coords = self.data.umap_coords
+        distances_all = np.sqrt(np.sum((umap_coords - umap_coords[segment_id])**2, axis=1))
+        if len(distances_all) > 1:
+            second_nn = np.partition(distances_all, 1)[1]
+            print(f"    2nd-nearest UMAP distance: {second_nn:.3f}")
         
         if self.app_mode == 'BLOBBING':
             # Show blob segments (sorted by distance to clicked point)
@@ -785,9 +1289,7 @@ class ClusteringApp:
             else:
                 self.selected_blob = None
                 # No blob clicked - show 20 nearest neighbors
-                umap_coords = self.data.umap_coords
-                distances = np.sqrt(np.sum((umap_coords - umap_coords[segment_id])**2, axis=1))
-                nearest_20 = np.argsort(distances)[:20]
+                nearest_20 = self._nearest_segments_with_spectrogram(segment_id, n_neighbors=20)
                 print(f"    Showing 20 nearest UMAP neighbors (no blob)")
                 
                 self.fig20_segments = nearest_20.tolist()
@@ -800,9 +1302,7 @@ class ClusteringApp:
         
         elif self.app_mode == 'PROOFREADING':
             # Show 20 nearest UMAP neighbors (sorted by distance, not by sort mode)
-            umap_coords = self.data.umap_coords
-            distances = np.sqrt(np.sum((umap_coords - umap_coords[segment_id])**2, axis=1))
-            nearest_20 = np.argsort(distances)[:20]  # 20 nearest including self
+            nearest_20 = self._nearest_segments_with_spectrogram(segment_id, n_neighbors=20)
             print(f"    Showing 20 nearest UMAP neighbors")
             
             self.fig20_segments = nearest_20.tolist()  # Already sorted by distance
@@ -815,9 +1315,7 @@ class ClusteringApp:
         
         else:  # CLUSTERING mode
             # Show 20 nearest UMAP neighbors (sorted by distance, not by sort mode)
-            umap_coords = self.data.umap_coords
-            distances = np.sqrt(np.sum((umap_coords - umap_coords[segment_id])**2, axis=1))
-            nearest_20 = np.argsort(distances)[:20]  # 20 nearest including self
+            nearest_20 = self._nearest_segments_with_spectrogram(segment_id, n_neighbors=20)
             print(f"    Showing 20 nearest UMAP neighbors")
             
             self.fig20_segments = nearest_20.tolist()  # Already sorted by distance
@@ -829,6 +1327,7 @@ class ClusteringApp:
             self._update_fig20()
         
         self._update_display()
+        self._update_pitch_figure()
     
     def _find_active_blob(self, umap_x: float, umap_y: float) -> Optional[Blob]:
         # First try: lookup by pixel (exact location on colored region)
@@ -852,6 +1351,27 @@ class ClusteringApp:
         distances = np.sqrt((umap_coords[:, 0] - umap_x)**2 + (umap_coords[:, 1] - umap_y)**2)
         nearest_idx = np.argmin(distances)
         return nearest_idx if distances[nearest_idx] < 0.5 else None
+
+    def _nearest_segments_with_spectrogram(self, segment_id: int, n_neighbors: int = 20,
+                                           max_scan: int = 5000) -> np.ndarray:
+        """Return nearest segments prioritized by available spectrogram slices."""
+        umap_coords = self.data.umap_coords
+        distances = np.sqrt(np.sum((umap_coords - umap_coords[segment_id])**2, axis=1))
+        sorted_idx = np.argsort(distances)
+
+        selected = []
+        for candidate in sorted_idx[:max_scan]:
+            spec = self.data.get_segment_spectrogram(int(candidate), context_sec=0.0)
+            if spec is not None and spec.size > 0:
+                selected.append(int(candidate))
+                if len(selected) >= n_neighbors:
+                    break
+
+        # Fallback to pure nearest neighbors if not enough with spectrograms
+        if len(selected) < n_neighbors:
+            return sorted_idx[:n_neighbors]
+
+        return np.array(selected, dtype=np.int32)
     
     def _on_key_press(self, event) -> None:
         key = event.key
@@ -999,7 +1519,7 @@ class ClusteringApp:
                 offset = n_segs
                 for i in range(n_segs - 1, -1, -1):
                     seg_id = self.fig20_segments[i]
-                    spec = self.data.get_segment_spectrogram(seg_id)
+                    spec = self.data.get_segment_spectrogram(seg_id, context_sec=0.0)
                     cols = spec.shape[1] if spec is not None and spec.size > 0 else 0
                     if total_cols + cols > MAX_COLS:
                         break
@@ -1033,9 +1553,25 @@ class ClusteringApp:
         # Export to HDF5
         elif key == 'x':
             self._export_to_hdf5()
+
+        # Toggle pitch trajectory figure
+        elif key == 'p':
+            self._toggle_pitch_view()
+
+        # Toggle spectrogram context view
+        elif key == 'v':
+            self._toggle_context_view()
+
+        # Reset UMAP zoom
+        elif key == 'z':
+            self._reset_umap_zoom()
         
         # Quit
         elif key == 'q':
+            try:
+                plt.close(self.fig_context)
+            except Exception:
+                pass
             plt.close('all')
     
     def _process_input(self) -> None:
@@ -1121,6 +1657,25 @@ class ClusteringApp:
         # Clear all caches so new sort mode applies everywhere
         self._fig33_sorted_cache.clear()
         self._fig34_sorted_cache.clear()
+
+        if self._is_nn_sort_mode():
+            # NN sorting is LOCAL: apply only to currently displayed Fig20 segments.
+            if self.fig20_segments:
+                base_segs = np.asarray(self.fig20_segments, dtype=np.int32)
+                sorted_segs = self._sort_segments(base_segs)
+                self.fig20_segments = sorted_segs.tolist()
+
+                # Keep the currently active row consistent with local sort result.
+                if self.fig33_current_group is not None:
+                    self._fig33_sorted_cache[self.fig33_current_group] = sorted_segs
+                elif self.fig34_current_cluster is not None:
+                    self._fig34_sorted_cache[self.fig34_current_cluster] = sorted_segs
+
+                self.fig20_offset = 0
+                self._update_fig20()
+
+            # Do NOT trigger full-grid refresh here; that would sort all groups/clusters.
+            return
         
         if self.fig20_segments:
             # Re-sort current view
@@ -1226,6 +1781,26 @@ class ClusteringApp:
     def _on_key_release(self, event) -> None:
         if event.key in ('shift', 'shift_l', 'shift_r'):
             self.shift_pressed = False
+
+    def _toggle_pitch_view(self) -> None:
+        """Toggle cluster pitch trajectory figure on/off."""
+        self.pitch_view_enabled = not self.pitch_view_enabled
+        state = 'ON' if self.pitch_view_enabled else 'OFF'
+        print(f"Pitch view: {state}")
+        self._update_pitch_figure()
+
+    def _toggle_context_view(self) -> None:
+        """Toggle extra spectrogram context around each vocalization."""
+        self.context_view_enabled = not self.context_view_enabled
+        context_sec = self.context_seconds if self.context_view_enabled else 0.0
+        self.spec_viewer.set_context_seconds(context_sec)
+        state = 'ON' if self.context_view_enabled else 'OFF'
+        print(f"Context view: {state} (±{context_sec:.3f}s)")
+
+        if self.fig20_segments:
+            self._update_fig20()  # This cascades to _update_context_viewer
+        else:
+            self._update_context_viewer([])  # Show OFF / empty state
     
     def _assign_selected_blob(self) -> None:
         """Assign selected blob to new blob group (BLOBBING mode only)."""
@@ -1372,6 +1947,7 @@ class ClusteringApp:
         self._fig34_sorted_cache.clear()  # Clear cluster cache
         self._update_cluster_visualizer()  # Update Cluster Grid
         self._update_display()
+        self._update_pitch_figure()
     
     def _move_segment_dialog(self) -> None:
         """Show dialog to move selected segment to a cluster."""
@@ -1415,6 +1991,7 @@ class ClusteringApp:
             self._update_fig20()
         
         self._update_cluster_visualizer()
+        self._update_pitch_figure()
     
     def _move_segment_to_precluster(self, seg_id: int, target_precluster: int) -> None:
         """Move segment to target precluster (PROOFREADING mode)."""
@@ -1533,6 +2110,7 @@ class ClusteringApp:
             self._update_fig20()
         
         self._update_cluster_visualizer()
+        self._update_pitch_figure()
     
     def _show_sort_dialog(self) -> None:
         """Show popup dialog to select sorting mode."""
@@ -1619,6 +2197,7 @@ class ClusteringApp:
         self._update_blobs()
         self._update_blob_visualizer()
         self._update_display()
+        self._update_pitch_figure()
         print("Reset all")
     
 
@@ -1684,7 +2263,9 @@ class ClusteringApp:
         print("  =/- : Threshold    ↑/↓ : Radius    ←/→ : Navigate")
         print("  w   : Assign blob  m   : Move segment")
         print("  u   : Merge        o   : Sort mode")
-        print("  c   : Cycle modes  x : Export (HDF5)")
+        print("  c   : Cycle modes  x   : Export (HDF5)")
+        print("  p   : Pitch view   v   : Context view")
+        print("  z   : Reset zoom")
         print("  q   : Quit")
         print("="*60 + "\n")
         plt.show()
@@ -1693,6 +2274,8 @@ class ClusteringApp:
 def main():
     parser = argparse.ArgumentParser(description="Semi-Automated Clustering Tool")
     parser.add_argument("data_path", help="Path to the HDF5 data file")
+    parser.add_argument("--no-preload", action="store_true",
+                        help="Disable eager spectrogram preload at startup")
     args = parser.parse_args()
     
     data_path = args.data_path
@@ -1702,8 +2285,10 @@ def main():
 
     data = load_data(data_path)
     print(f"Loaded {data.n_segments} segments from {data.n_files} files")
-    
-    ClusteringApp(data).run()
+    preload_mode = "disabled" if args.no_preload else "enabled"
+    print(f"Spectrogram preload: {preload_mode}")
+
+    ClusteringApp(data, preload_override=not args.no_preload).run()
 
 
 if __name__ == "__main__":

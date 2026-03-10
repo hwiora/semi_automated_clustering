@@ -24,21 +24,26 @@ class SpectrogramViewer:
         self.fig = fig
         self.n_rows = n_rows
         self.n_cols = n_cols
+        self.context_sec = 0.0
         self._segment_axes = {}  # Map from axis id to segment id
+
+    def set_context_seconds(self, context_sec: float) -> None:
+        """Kept for API compatibility but Spectrogram Viewer always renders without context."""
+        pass  # Context is now handled exclusively by the Context Viewer
     
     def display_with_highlight(self, segment_ids: List[int], highlight_id: Optional[int] = None) -> None:
-        """Display spectrograms with optional highlight."""
+        """Display spectrograms with optional highlight. Always renders without context."""
         self.fig.clear()
         self._segment_axes = {}
         
         if not segment_ids:
             return
         
-        # Get spectrogram dimensions for each segment
+        # Get spectrogram dimensions for each segment (always without context)
         specs = []
         col_counts = []
         for seg_id in segment_ids:
-            spec = self.data.get_segment_spectrogram(seg_id)
+            spec = self.data.get_segment_spectrogram(seg_id, context_sec=0.0)
             if spec is not None and spec.size > 0:
                 specs.append(spec)
                 col_counts.append(spec.shape[1])
@@ -76,7 +81,8 @@ class SpectrogramViewer:
                 break
             
             # Create axis for this spectrogram
-            ax = self.fig.add_axes([x_pos, bottom_margin, width - gap, row_height])
+            axis_width = max(width - gap, 0.001)
+            ax = self.fig.add_axes([x_pos, bottom_margin, axis_width, row_height])
             
             # Display spectrogram
             ax.imshow(spec[::-1, :], aspect='auto', cmap='inferno', interpolation='nearest')

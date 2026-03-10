@@ -8,6 +8,7 @@ import pandas as pd
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Dict, Any
+from collections import OrderedDict
 import h5py
 
 
@@ -22,8 +23,28 @@ class FlatData:
     hdf5_path: Optional[Path] = None  # HDF5 file path (HDF5 mode)
     
     # Cached spectrograms (loaded on demand)
-    _spectrogram_cache: Dict[int, np.ndarray] = field(default_factory=dict, repr=False)
-    _segment_spec_cache: Dict[int, np.ndarray] = field(default_factory=dict, repr=False)
+    _spectrogram_cache: OrderedDict = field(default_factory=OrderedDict, repr=False)
+    _segment_spec_cache: OrderedDict = field(default_factory=OrderedDict, repr=False)
+    _pitch_cache: OrderedDict = field(default_factory=OrderedDict, repr=False)
+    max_spectrogram_cache: int = 2000
+    max_segment_spec_cache: int = 20000
+    max_pitch_cache: int = 2000
+
+    @staticmethod
+    def _cache_get(cache: OrderedDict, key):
+        if key not in cache:
+            return None
+        value = cache.pop(key)
+        cache[key] = value
+        return value
+
+    @staticmethod
+    def _cache_put(cache: OrderedDict, key, value, max_size: int) -> None:
+        if key in cache:
+            cache.pop(key)
+        cache[key] = value
+        while len(cache) > max_size:
+            cache.popitem(last=False)
     
     @property
     def n_segments(self) -> int:
@@ -73,8 +94,9 @@ class FlatData:
     
     def get_spectrogram(self, file_id: int) -> Optional[np.ndarray]:
         """Load spectrogram for a file (cached)."""
-        if file_id in self._spectrogram_cache:
-            return self._spectrogram_cache[file_id]
+        cached = self._cache_get(self._spectrogram_cache, int(file_id))
+        if cached is not None:
+            return cached
         
         if self.hdf5_path is not None:
             # HDF5 mode - try multiple key formats
@@ -92,7 +114,7 @@ class FlatData:
                 for spec_key in possible_keys:
                     if spec_key in f:
                         spec = f[spec_key][:]
-                        self._spectrogram_cache[file_id] = spec
+                        self._cache_put(self._spectrogram_cache, int(file_id), spec, self.max_spectrogram_cache)
                         return spec
                 
                 # Also check if key exists directly in spectrograms group
@@ -100,7 +122,7 @@ class FlatData:
                 for key in [f'file_{file_id:04d}', str(file_id)]:
                     if key in spec_grp:
                         spec = spec_grp[key][:]
-                        self._spectrogram_cache[file_id] = spec
+                        self._cache_put(self._spectrogram_cache, int(file_id), spec, self.max_spectrogram_cache)
                         return spec
                         
         elif self.spectrograms_dir is not None:
@@ -108,21 +130,60 @@ class FlatData:
             spec_file = self.spectrograms_dir / f"{file_id}.npy"
             if spec_file.exists():
                 spec = np.load(spec_file)
-                self._spectrogram_cache[file_id] = spec
+                self._cache_put(self._spectrogram_cache, int(file_id), spec, self.max_spectrogram_cache)
                 return spec
         
         return None
+
+    def get_pitch(self, file_id: int):
+        """Load pitch trajectory for a file as (time, f0), if available."""
+        cached = self._cache_get(self._pitch_cache, int(file_id))
+        if cached is not None:
+            return cached
+
+        if self.hdf5_path is None:
+            return None
+
+        with h5py.File(self.hdf5_path, 'r') as f:
+            if 'pitch' not in f:
+                return None
+            pitch_grp = f['pitch']
+            key = str(int(file_id))
+            if key not in pitch_grp:
+                return None
+            file_grp = pitch_grp[key]
+            if 'time' not in file_grp or 'f0' not in file_grp:
+                return None
+            t = file_grp['time'][:]
+            f0 = file_grp['f0'][:]
+
+        out = (t, f0)
+        self._cache_put(self._pitch_cache, int(file_id), out, self.max_pitch_cache)
+        return out
     
-    def get_segment_spectrogram(self, segment_id: int) -> Optional[np.ndarray]:
+    def get_segment_spectrogram(self, segment_id: int, context_sec: float = 0.0) -> Optional[np.ndarray]:
         """Extract spectrogram slice for a specific segment (cached)."""
+        segment_id = int(segment_id)
+        context_sec = max(0.0, float(context_sec))
+        cache_key = (segment_id, context_sec)
+
         # Check cache first
-        if segment_id in self._segment_spec_cache:
-            return self._segment_spec_cache[segment_id]
+        cached = self._cache_get(self._segment_spec_cache, cache_key)
+        if cached is not None:
+            return cached
         
         row = self.segments.iloc[segment_id]
         file_id = int(row['file_id'])
         onset_sec = float(row['onset_sec'])
         duration_sec = float(row['duration_sec'])
+
+        if not (np.isfinite(onset_sec) and np.isfinite(duration_sec)):
+            return None
+        if duration_sec <= 0:
+            return None
+
+        onset_sec = max(0.0, onset_sec - context_sec)
+        duration_sec = max(0.0, duration_sec + 2.0 * context_sec)
         
         # Compute samples from seconds using stored sample rate
         sr = self.scanrate
@@ -135,28 +196,70 @@ class FlatData:
         
         # Convert samples to spectrogram columns
         # hop_length = hop size in samples (e.g., 128)
-        hop_length = self.parameters.get('hop_length', self.parameters.get('nonoverlap', 128))
+        hop_length = self.parameters.get(
+            'hop_length',
+            self.parameters.get('spec_hop_length', self.parameters.get('nonoverlap', 128))
+        )
         start_col = onset_sample // hop_length
         end_col = (onset_sample + duration_samples) // hop_length
         
         # Clamp to valid range
+        n_cols_total = int(full_spec.shape[1])
+        if n_cols_total <= 0:
+            return None
+
         start_col = max(0, start_col)
-        end_col = min(full_spec.shape[1], end_col)
+        end_col = min(n_cols_total, end_col)
+
+        # Ensure at least one column for extremely short segments or minor boundary mismatches
+        if start_col >= n_cols_total:
+            start_col = n_cols_total - 1
+        if end_col <= start_col:
+            end_col = min(n_cols_total, start_col + 1)
         
         segment_spec = full_spec[:, start_col:end_col]
         
         # Cache it
-        self._segment_spec_cache[segment_id] = segment_spec
+        self._cache_put(self._segment_spec_cache, cache_key, segment_spec, self.max_segment_spec_cache)
         return segment_spec
+
+    def get_segment_pitch(self, segment_id: int, context_sec: float = 0.0):
+        """Extract pitch trajectory for a segment as (relative_time, f0), if available."""
+        row = self.segments.iloc[int(segment_id)]
+        file_id = int(row['file_id'])
+        onset_sec = float(row['onset_sec'])
+        duration_sec = float(row['duration_sec'])
+        context_sec = max(0.0, float(context_sec))
+
+        if not (np.isfinite(onset_sec) and np.isfinite(duration_sec)):
+            return None
+        if duration_sec <= 0:
+            return None
+
+        pitch = self.get_pitch(file_id)
+        if pitch is None:
+            return None
+
+        t, f0 = pitch
+        start = max(0.0, onset_sec - context_sec)
+        end = onset_sec + duration_sec + context_sec
+        mask = np.logical_and(t >= start, t <= end)
+        if not np.any(mask):
+            return None
+
+        t_seg = t[mask] - start
+        f0_seg = f0[mask]
+        return t_seg, f0_seg
     
-    def precache_all_spectrograms(self) -> None:
+    def precache_all_spectrograms(self, max_segments: Optional[int] = None) -> None:
         """Pre-load all segment spectrograms into cache for faster access."""
-        print(f"Pre-caching {self.n_segments} spectrograms...")
-        for seg_id in range(self.n_segments):
+        n_segments = self.n_segments if max_segments is None else min(self.n_segments, int(max_segments))
+        print(f"Pre-caching {n_segments} spectrograms...")
+        for seg_id in range(n_segments):
             self.get_segment_spectrogram(seg_id)
             if (seg_id + 1) % 500 == 0:
-                print(f"  Cached {seg_id + 1}/{self.n_segments}...")
-        print(f"Done caching {self.n_segments} spectrograms.")
+                print(f"  Cached {seg_id + 1}/{n_segments}...")
+        print(f"Done caching {n_segments} spectrograms.")
     
     def save_clusters(self, output_path: str) -> None:
         """Save current cluster assignments to file."""
@@ -189,6 +292,26 @@ def load_data(path: str) -> FlatData:
         return _load_from_parquet_file(path)
     else:
         raise ValueError(f"Unknown data format: {path}")
+
+
+def _sanitize_segments_df(segments: pd.DataFrame, source: str) -> pd.DataFrame:
+    """Drop segments with invalid timing to avoid downstream indexing/display errors."""
+    if segments.empty:
+        return segments
+
+    if 'onset_sec' not in segments.columns or 'duration_sec' not in segments.columns:
+        return segments
+
+    onset = pd.to_numeric(segments['onset_sec'], errors='coerce').to_numpy(dtype=np.float64)
+    duration = pd.to_numeric(segments['duration_sec'], errors='coerce').to_numpy(dtype=np.float64)
+    valid = np.logical_and(np.isfinite(onset), np.isfinite(duration))
+    valid = np.logical_and(valid, duration > 0)
+
+    dropped = int((~valid).sum())
+    if dropped > 0:
+        print(f"Warning: Dropped {dropped} invalid segments from {source} (non-finite or non-positive duration).")
+
+    return segments.loc[valid].reset_index(drop=True)
 
 
 def _load_from_hdf5(hdf5_path: Path) -> FlatData:
@@ -235,6 +358,8 @@ def _load_from_hdf5(hdf5_path: Path) -> FlatData:
         # Ensure cluster_id exists
         if 'cluster_id' not in segments.columns:
             segments['cluster_id'] = 0
+
+        segments = _sanitize_segments_df(segments, str(hdf5_path))
     
     # Debug output
     print(f"Loaded {len(segments)} segments from HDF5")
@@ -276,6 +401,8 @@ def _load_from_parquet_dir(data_dir: Path) -> FlatData:
     # Ensure cluster_id exists
     if 'cluster_id' not in segments.columns:
         segments['cluster_id'] = 0
+
+    segments = _sanitize_segments_df(segments, str(data_dir))
     
     return FlatData(
         segments=segments,
@@ -291,6 +418,8 @@ def _load_from_parquet_file(parquet_path: Path) -> FlatData:
     
     if 'cluster_id' not in segments.columns:
         segments['cluster_id'] = 0
+
+    segments = _sanitize_segments_df(segments, str(parquet_path))
     
     # Try to find spectrograms in parent directory
     spectrograms_dir = parquet_path.parent / 'spectrograms'
@@ -302,8 +431,6 @@ def _load_from_parquet_file(parquet_path: Path) -> FlatData:
         spectrograms_dir=spectrograms_dir if spectrograms_dir.exists() else None
     )
 
-
-    print(f"Saved to {output_path}")
 
 def save_to_hdf5(data: FlatData, output_path: str, compress: bool = True) -> None:
     """Save FlatData to HDF5 format."""
@@ -392,6 +519,21 @@ def save_to_hdf5(data: FlatData, output_path: str, compress: bool = True) -> Non
                     for key in src['embeddings'].keys():
                         data_arr = src['embeddings'][key][:]
                         emb_grp.create_dataset(key, data=data_arr, compression=compression)
+
+        # Copy pitch tracks from source HDF5 if available
+        if data.hdf5_path is not None and data.hdf5_path != output_path:
+            with h5py.File(data.hdf5_path, 'r') as src:
+                if 'pitch' in src:
+                    src_pitch = src['pitch']
+                    dst_pitch = f.create_group('pitch')
+                    for key in src_pitch.keys():
+                        src_obj = src_pitch[key]
+                        if isinstance(src_obj, h5py.Dataset):
+                            dst_pitch.create_dataset(key, data=src_obj[:], compression=compression)
+                        else:
+                            dst_sub = dst_pitch.create_group(key)
+                            for subkey in src_obj.keys():
+                                dst_sub.create_dataset(subkey, data=src_obj[subkey][:], compression=compression)
         
         # Save UMAP maprange if available
         if 'umap_maprange' in data.parameters and 'umap_maprange' not in f:

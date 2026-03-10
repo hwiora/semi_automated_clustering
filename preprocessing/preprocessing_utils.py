@@ -7,6 +7,16 @@ import numpy as np
 from glob import glob
 
 
+def _natural_sort_key(value):
+    """Natural-sort key that keeps numeric directory names in numeric order."""
+    text = str(value)
+    if text.isdigit():
+        return (0, int(text))
+    parts = re.split(r'(\d+)', text)
+    parsed = [int(p) if p.isdigit() else p.lower() for p in parts if p != '']
+    return (1, parsed)
+
+
 def convert_day_to_str(day):
     """Convert a day number to a zero-padded 3-digit string if applicable.
     
@@ -55,7 +65,7 @@ def get_all_days(data_dir, max_day=900):
             # Return None to indicate flat structure
             return [None]
     
-    return sorted(valid_groups)
+    return sorted(valid_groups, key=_natural_sort_key)
 
 
 def get_wav_files_for_day(data_dir, day):
@@ -70,7 +80,7 @@ def get_wav_files_for_day(data_dir, day):
     """
     if day is None:
         # Flat structure - wav files directly in data_dir
-        return glob(os.path.join(data_dir, '*.wav'))
+        return sorted(glob(os.path.join(data_dir, '*.wav')))
     else:
         # Day/Subdir folder structure
         # Use day directly as it is now likely a string from get_all_days
@@ -83,7 +93,7 @@ def get_wav_files_for_day(data_dir, day):
         # If not, try the padded version (handles "1" -> "001" logic if that was implicit)
         # But wait, get_all_days returns actual directory names now.
         # So we should just use str(day).
-        return glob(os.path.join(data_dir, str(day), '*.wav'))
+        return sorted(glob(os.path.join(data_dir, str(day), '*.wav')))
 
 
 def get_day_string(day):
